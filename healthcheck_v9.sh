@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 # ==========================================================================
-# Smart Server Healthcheck v9.0 — Ferhat
+# Smart Server Healthcheck v9.1 — Ferhat
 # ==========================================================================
+# CHANGES in v9.1:
+#   - CPU: uses 5m average instead of 1m (avoids RDP/burst false positives)
+#   - UFW: improved detection (handles verbose/numbered output)
+#   - K3s: native support (k3s-server, local-path-provisioner, k3s kubectl)
+#   - Process allowlist: added netdata, Xorg, fwupd, xrdp, k3s, flannel, coredns
+#   - Fail2Ban: 0 bans is now OK, not a warning
+#   - Default EXPECTED_PUBLIC_PORTS includes 3389 (RDP)
+#
 # CHANGES in v9.0:
 #   - Compact Slack-friendly output: summary-first, only problems listed
 #   - External exposure scan: public IP open port check
@@ -48,7 +56,7 @@ EXTERNAL_SCAN="${EXTERNAL_SCAN:-true}"
 
 # ── Ports that are EXPECTED to be reachable from outside
 # e.g. "22 80 443"  — anything else triggers a warning
-EXPECTED_PUBLIC_PORTS="${EXPECTED_PUBLIC_PORTS:-22 80 443}"
+EXPECTED_PUBLIC_PORTS="${EXPECTED_PUBLIC_PORTS:-22 80 443 3389}"
 
 # ══════════════════════════════════════════════════════════════
 # ── HARDENING / RUNTIME
@@ -139,7 +147,8 @@ HAS_PYTHON=false;  (cmd_exists python3 || cmd_exists python) && HAS_PYTHON=true
 HAS_DOCKER=false;  cmd_exists docker  && HAS_DOCKER=true
 HAS_COMPOSE=false; ($HAS_DOCKER && docker compose version >/dev/null 2>&1) && HAS_COMPOSE=true
 HAS_PODMAN=false;  cmd_exists podman  && HAS_PODMAN=true
-HAS_K8S=false;     cmd_exists kubectl && HAS_K8S=true
+HAS_K8S=false;     (cmd_exists kubectl || cmd_exists k3s) && HAS_K8S=true
+HAS_K3S=false;     cmd_exists k3s && HAS_K3S=true
 
 HAS_UFW=false;     cmd_exists ufw           && HAS_UFW=true
 HAS_NFTABLES=false; cmd_exists nft          && HAS_NFTABLES=true
@@ -287,7 +296,7 @@ get_public_ip() {
 # HEADER (compact)
 # ══════════════════════════════════════════════════════════════
 printf "%b\n" "${BOLD}══ ${HOST_ALIAS}${PUBLIC_IP_HINT:+ @ ${PUBLIC_IP_HINT}} ══${NC}"
-printf "%b\n" "${DIM}Healthcheck v9.0 | ${DATE} | Mode: ${CHECK_MODE}${NC}"
+printf "%b\n" "${DIM}Healthcheck v9.1 | ${DATE} | Mode: ${CHECK_MODE}${NC}"
 sleep_s
 
 # ══════════════════════════════════════════════════════════════
@@ -307,14 +316,25 @@ sleep_s
 # ══════════════════════════════════════════════════════════════
 section "Resources"
 
-# CPU
+# CPU — uses 5m average to avoid burst/RDP false positives
 if [[ -r /proc/loadavg ]]; then
   LOAD1="$(awk '{print $1}' /proc/loadavg)"
+  LOAD5="$(awk '{print $2}' /proc/loadavg)"
+  LOAD15="$(awk '{print $3}' /proc/loadavg)"
   CORES="$(nproc 2>/dev/null || echo 1)"
+  OK_T="$(awk "BEGIN{printf \"%.2f\",$CORES*0.70}")"
   WARN_T="$(awk "BEGIN{printf \"%.2f\",$CORES*1.20}")"
-  if   cmp_float "$LOAD1" "<" "$(awk "BEGIN{printf \"%.2f\",$CORES*0.70}")"; then ok "CPU ${LOAD1}/${CORES}cores"
-  elif cmp_float "$LOAD1" "<" "$WARN_T"; then warn "CPU HIGH ${LOAD1}/${CORES}cores"
-  else crit "CPU CRITICAL ${LOAD1}/${CORES}cores"; fi
+  CRIT_T="$(awk "BEGIN{printf \"%.2f\",$CORES*2.00}")"
+  detail "Load: ${LOAD1} / ${LOAD5} / ${LOAD15} (${CORES} cores)"
+  # Judge on 5m avg; mention 1m only if it's spiking
+  if   cmp_float "$LOAD5" "<" "$OK_T";   then
+    if cmp_float "$LOAD1" ">" "$WARN_T"; then
+      info "CPU OK (5m: ${LOAD5}) but 1m spike: ${LOAD1}"
+    else
+      ok "CPU ${LOAD5}/${CORES}cores (5m avg)"
+    fi
+  elif cmp_float "$LOAD5" "<" "$WARN_T"; then warn "CPU HIGH 5m:${LOAD5} 1m:${LOAD1} (${CORES}cores)"
+  else crit "CPU CRITICAL 5m:${LOAD5} 1m:${LOAD1} (${CORES}cores)"; fi
 fi
 
 # Memory
@@ -417,8 +437,17 @@ section "Firewall"
 FIREWALL_FOUND=false
 if $HAS_UFW; then
   FIREWALL_FOUND=true
-  STATUS="$(maybe_sudo ufw status 2>/dev/null || true)"
-  echo "$STATUS" | grep -q "Status: active" && ok "UFW active" || warn "UFW NOT active"
+  # Try multiple ways to detect UFW status (some systems need sudo, some don't)
+  _ufw_active=false
+  STATUS="$(maybe_sudo ufw status 2>/dev/null || ufw status 2>/dev/null || true)"
+  if echo "$STATUS" | grep -qi "Status: active"; then
+    _ufw_active=true
+  elif maybe_sudo ufw status verbose 2>/dev/null | grep -qi "Status: active"; then
+    _ufw_active=true
+  elif systemctl is-active --quiet ufw 2>/dev/null; then
+    _ufw_active=true
+  fi
+  $_ufw_active && ok "UFW active" || warn "UFW NOT active"
 fi
 if $HAS_NFTABLES && ! $FIREWALL_FOUND; then
   FIREWALL_FOUND=true
@@ -444,7 +473,8 @@ if $HAS_FAIL2BAN; then
       TOTAL_BANNED=$((TOTAL_BANNED + B))
       (( B > 0 )) && info "Fail2Ban '$j': $B banned"
     done
-    (( TOTAL_BANNED == 0 )) && ok "Fail2Ban: 0 bans" || warn "Fail2Ban total bans: $TOTAL_BANNED"
+    (( TOTAL_BANNED == 0 )) && ok "Fail2Ban: all clear, 0 bans" \
+      || info "Fail2Ban: $TOTAL_BANNED IP(s) currently banned"
   fi
 fi
 sleep_s
@@ -612,8 +642,12 @@ if $HAS_DOCKER || $HAS_K8S; then
   fi
 
   if $HAS_K8S; then
-    detail "Kubernetes services (type=NodePort/LoadBalancer):"
-    _k8s_exposed="$(kubectl get svc --all-namespaces -o wide 2>/dev/null \
+    # Use k3s kubectl if regular kubectl not available
+    KUBECTL="kubectl"
+    ! cmd_exists kubectl && cmd_exists k3s && KUBECTL="k3s kubectl"
+
+    detail "K3s/K8s services (type=NodePort/LoadBalancer):"
+    _k8s_exposed="$($KUBECTL get svc --all-namespaces -o wide 2>/dev/null \
       | awk '$3=="NodePort" || $3=="LoadBalancer" {print $1"/"$2, $3, $5}' || true)"
     if [[ -n "$_k8s_exposed" ]]; then
       warn "K8s externally exposed services:"
@@ -623,7 +657,7 @@ if $HAS_DOCKER || $HAS_K8S; then
     fi
 
     # Pods in host network
-    _k8s_hostnet="$(kubectl get pods --all-namespaces -o json 2>/dev/null \
+    _k8s_hostnet="$($KUBECTL get pods --all-namespaces -o json 2>/dev/null \
       | python3 -c "
 import json,sys
 data=json.load(sys.stdin)
@@ -893,7 +927,7 @@ DEV_FILES="$(find /dev -maxdepth 1 -type f 2>/dev/null | grep -v '\.d$' || true)
 [[ -n "$DEV_FILES" ]] && warn "Files in /dev: $DEV_FILES" || ok "Clean /dev"
 
 # Suspicious processes
-PROC_ALLOW="systemd|init|sshd|bash|sh|dash|nginx|apache2|httpd|ufw|cron|crond|dockerd|containerd|runc|mysqld|mariadbd|php-fpm|journald|rsyslogd|auditd|rpcbind|dbus|polkitd|NetworkManager|chronyd|ntpd|fail2ban|wg|wireguard|redis-server|postgres|memcached|node|python3|ruby|java|perl|atd|acpid|irqbalance|snapd|multipathd|systemd-|agetty|login|su|containerd-shim|docker-proxy|kworker|ksoftirqd|migration|rcu|lsmd|packagekit|tuned|accounts-daemon|udisksd|ModemManager|go.d.plugin|apps.plugin|traefik|soketi-server|tailscaled|smbd|nmbd|site_total|unattended-upgr"
+PROC_ALLOW="systemd|init|sshd|bash|sh|dash|nginx|apache2|httpd|ufw|cron|crond|dockerd|containerd|runc|mysqld|mariadbd|php-fpm|journald|rsyslogd|auditd|rpcbind|dbus|polkitd|NetworkManager|chronyd|ntpd|fail2ban|wg|wireguard|redis-server|postgres|memcached|node|python3|ruby|java|perl|atd|acpid|irqbalance|snapd|multipathd|systemd-|agetty|login|su|containerd-shim|docker-proxy|kworker|ksoftirqd|migration|rcu|lsmd|packagekit|tuned|accounts-daemon|udisksd|ModemManager|go.d.plugin|apps.plugin|traefik|soketi-server|tailscaled|smbd|nmbd|site_total|unattended-upgr|k3s|k3s-server|k3s-agent|local-path-prov|flannel|coredns|netdata|Xorg|xrdp|xrdp-sesman|fwupd|avahi-daemon|dnsmasq"
 SUSPICIOUS="$(ps -eo pid,user,comm --sort=-%mem 2>/dev/null \
   | awk -v allow="$PROC_ALLOW" 'NR>1 && $2=="root" && $3 !~ allow {print}' || true)"
 [[ -z "$SUSPICIOUS" ]] && ok "No unexpected root processes" \
