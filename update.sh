@@ -9,6 +9,11 @@ RESTART_SERVICES=0   # 1 = needrestart restarts services using outdated librarie
 INSTALL_TOOLS=1      # 1 = install fail2ban/needrestart/debsums if missing, 0 = use only what exists
 JOURNAL_KEEP_DAYS=30
 JOURNAL_MAX_SIZE=500M
+LOG_KEEP_DAYS=14     # rotated logs (*.gz, *.1, *.old) older than this are deleted
+TMP_KEEP_DAYS=10     # files in /tmp and /var/tmp untouched for this long are deleted
+CACHE_KEEP_DAYS=30   # files in ~/.cache unused for this long are deleted
+DOCKER_PRUNE=1       # 0 = off, 1 = dangling images + build cache,
+                     # 2 = ALL unused images + stopped containers + unused networks (never volumes)
 DISK_WARN_PCT=85
 # -----------------------------------------------------------------------------
 
@@ -54,16 +59,51 @@ if need needrestart needrestart; then
 fi
 
 section "2. CLEANUP"
+USED_BEFORE=$(df -kP / | awk 'NR==2{print $3}')
+removed() { echo "    removed $(wc -l) file(s)"; }
+
+echo "--- apt: unused packages, old kernels, package cache, leftover configs"
 run "apt autoremove" apt-get autoremove --purge -y
 run "apt clean"      apt-get clean
-dpkg -l | awk '/^rc/{print $2}' | xargs -r apt-get purge -y   # leftover configs of removed packages
+dpkg -l | awk '/^rc/{print $2}' | xargs -r apt-get purge -y
+
+echo "--- systemd journal (keep ${JOURNAL_KEEP_DAYS}d / $JOURNAL_MAX_SIZE)"
+journalctl --rotate   # close the active file so vacuum can also trim it
 journalctl --vacuum-time="${JOURNAL_KEEP_DAYS}d" --vacuum-size="$JOURNAL_MAX_SIZE"
-rm -rf /var/crash/* 2>/dev/null
+
+echo "--- rotated logs older than $LOG_KEEP_DAYS days (live logs are not touched)"
+find /var/log -xdev -type f -not -path '/var/log/journal/*' -mtime +"$LOG_KEEP_DAYS" \
+  \( -name '*.gz' -o -name '*.xz' -o -name '*.bz2' -o -name '*.[0-9]' -o -name '*.old' \) -print -delete | removed
+
+echo "--- crash reports and core dumps"
+find /var/crash /var/lib/systemd/coredump -mindepth 1 -print -delete 2>/dev/null | removed
+
+echo "--- temp files untouched for $TMP_KEEP_DAYS days"
+systemd-tmpfiles --clean 2>/dev/null   # the system's own temp-file rules
+# mtime AND atime must both be old; private dirs of running services and JVM stats are skipped
+find /tmp /var/tmp -xdev -mindepth 1 -type f -mtime +"$TMP_KEEP_DAYS" -atime +"$TMP_KEEP_DAYS" \
+  -not -path '*/systemd-private-*' -not -path '*/hsperfdata_*' -print -delete 2>/dev/null | removed
+
+echo "--- user caches unused for $CACHE_KEEP_DAYS days, and trash"
+for home in /root /home/*; do
+  [ -d "$home/.cache" ] && find "$home/.cache" -xdev -type f -atime +"$CACHE_KEEP_DAYS" -print -delete 2>/dev/null
+  find "$home/.local/share/Trash" -mindepth 2 -print -delete 2>/dev/null
+done | removed
+
 if have snap; then
+  echo "--- snap: old revisions and download cache"
   snap set system refresh.retain=2
   snap list --all 2>/dev/null | awk '/disabled/{print $1, $3}' |
     while read -r name rev; do snap remove "$name" --revision="$rev" </dev/null; done
+  rm -rf /var/lib/snapd/cache/* 2>/dev/null
 fi
+if have flatpak; then
+  echo "--- flatpak: unused runtimes"
+  run "flatpak uninstall --unused" flatpak uninstall --unused -y --noninteractive
+fi
+
+USED_AFTER=$(df -kP / | awk 'NR==2{print $3}')
+echo "Cleanup freed $(( (USED_BEFORE - USED_AFTER) / 1024 )) MB on /"
 
 section "3. BRUTE-FORCE PROTECTION (fail2ban)"
 if need fail2ban-server fail2ban python3-systemd; then
@@ -151,6 +191,13 @@ while read -r pct mnt; do warn "inodes on $mnt are $pct used"; done < <(
   df -iP -x tmpfs -x devtmpfs -x squashfs -x overlay | awk -v t="$DISK_WARN_PCT" 'NR>1 && $5+0>=t {print $5, $6}')
 uptime
 free -h
+# What the cleanup can't decide for you: the biggest remaining space users.
+echo "--- Biggest directories under /var:"
+du -xh --max-depth=2 /var 2>/dev/null | sort -rh | head -10
+echo "--- Files over 200 MB on /:"
+find / -xdev -type f -size +200M -not -path '/var/lib/docker/*' -not -path '/var/lib/containerd/*' \
+  -exec ls -lh {} + 2>/dev/null | awk '{print $5, $9}' | sort -rh | head -15
+if have docker && docker info >/dev/null 2>&1; then echo "--- Docker disk usage:"; docker system df; fi
 echo "Disk free on / before: $DISK_BEFORE | after: $(df -h / | awk 'NR==2{print $4}')"
 
 section "8. SUMMARY"
